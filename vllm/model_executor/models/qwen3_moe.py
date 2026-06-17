@@ -337,6 +337,35 @@ class Qwen3MoeAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
+        # Experimental hash-projection feature (enabled via `--hash-dim`).
+        # A single random [head_dim, hash_dim] matrix is shared by every head.
+        # It does not depend on the head count, so its shape is unchanged under
+        # tensor parallelism. The matrix dtype follows the model's activation
+        # dtype so the matmul against q/k requires no casting.
+        model_config = get_current_vllm_config().model_config
+        hash_dim = model_config.hash_dim
+        if hash_dim:
+            self.hash_dim = hash_dim
+            # Generate the matrix deterministically so every tensor-parallel
+            # rank produces an identical matrix (its content must match across
+            # ranks). The seed mixes in the layer index so different layers
+            # still get different matrices, while staying rank-independent.
+            seed = (model_config.seed or 0) + extract_layer_index(prefix)
+            generator = torch.Generator().manual_seed(seed)
+            self.register_buffer(
+                "hash_matrix",
+                torch.randn(
+                    self.head_dim,
+                    hash_dim,
+                    dtype=model_config.dtype,
+                    generator=generator,
+                ),
+                persistent=False,
+            )
+        else:
+            self.hash_dim = None
+            self.hash_matrix = None
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -353,6 +382,17 @@ class Qwen3MoeAttention(nn.Module):
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
+        if self.hash_matrix is not None:
+            # Project each head's post-RoPE query/key with the shared random
+            # matrix. q is [num_tokens, num_heads * head_dim], so we view it as
+            # [num_tokens, num_heads, head_dim] @ [head_dim, hash_dim]
+            # -> [num_tokens, num_heads, hash_dim]. All heads use the same
+            # matrix; the same applies to the (possibly fewer) k heads.
+            q_by_head = q.view(*q.shape[:-1], self.num_heads, self.head_dim)
+            k_by_head = k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
+            q_hashed = torch.matmul(q_by_head, self.hash_matrix)  # noqa: F841
+            k_hashed = torch.matmul(k_by_head, self.hash_matrix)  # noqa: F841
+            # NOTE: the matmul outputs are intentionally unused for now.
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output

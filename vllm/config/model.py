@@ -206,6 +206,13 @@ class ModelConfig:
     graph and always execute the model in eager mode. If False, we will use
     CUDA graph and eager execution in hybrid for maximal performance and
     flexibility."""
+    hash_dim: int | None = None
+    """If set, enable the experimental hash-projection feature for Qwen3 models.
+    After RoPE, the query and key of every head are multiplied by a randomly
+    generated `[head_dim, hash_dim]` matrix that is shared across all heads
+    (and identical in shape under tensor parallelism). The matrix dtype follows
+    the model's activation dtype. The matmul output is currently unused. This
+    only takes effect for Qwen3 model architectures."""
     enable_return_routed_experts: bool = False
     """Whether to return routed experts."""
     max_logprobs: int = 20
